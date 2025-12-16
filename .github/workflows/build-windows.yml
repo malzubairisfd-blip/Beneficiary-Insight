@@ -1,0 +1,58 @@
+name: Build Windows Portable EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer (Vite)
+        run: npm run build:renderer
+        env:
+          NODE_ENV: production
+
+      - name: Build electron main (tsc)
+        run: npm run build:electron
+        env:
+          NODE_ENV: production
+
+      - name: Run electron-builder (portable exe, x64)
+        run: npx electron-builder --win portable --x64
+        env:
+          # Optional code signing secrets (set in repo Settings -> Secrets)
+          CSC_LINK: ${{ secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD || '' }}
+
+      - name: List dist directory (debug)
+        run: dir /b dist || echo "dist not found"
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeneficiaryInsights-windows-portable
+          path: dist/*.exe
