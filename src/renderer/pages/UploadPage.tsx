@@ -10,6 +10,13 @@ declare global {
       aiAnalyze: (payload: any) => Promise<any>;
       cacheSave: (cacheId: string, payload: any) => Promise<any>;
       cacheGet: (cacheId: string) => Promise<any>;
+      pairwiseAnalyze: (records: any[]) => Promise<any>;
+      runAudit: (cacheId: string) => Promise<any>;
+      generateExport: (cacheId: string) => Promise<any>;
+      settingsGet: () => Promise<any>;
+      settingsSave: (settings: any) => Promise<any>;
+      onWorkerProgress: (cb: (ev: any, msg: any) => void) => void;
+      onPairwiseProgress: (cb: (ev: any, msg: any) => void) => void;
     };
   }
 }
@@ -55,11 +62,25 @@ export default function UploadPage() {
   const [clusters, setClusters] = useState<any[]>([]);
   const rawRowsRef = useRef<any[]>([]);
   const [fileReadProgress, setFileReadProgress] = useState(0);
+  const [progressInfo, setProgressInfo] = useState<{ status: string; progress: number; completed?: number; total?: number }>({ status: "idle", progress: 0 });
 
   useEffect(() => {
     const allRequiredMapped = REQUIRED_MAPPING_FIELDS.every((f) => !!mapping[f]);
     setIsMappingComplete(allRequiredMapped);
   }, [mapping]);
+
+  useEffect(() => {
+    // subscribe to worker progress forwarded from main (if any)
+    try {
+      window.electronAPI.onWorkerProgress((_, msg) => {
+        if (!msg) return;
+        setProgressInfo({ status: msg.status || "working", progress: msg.progress ?? 0, completed: msg.completed, total: msg.total });
+        setWorkerStatus(msg.status || "working");
+      });
+    } catch {
+      // ignore if not available
+    }
+  }, []);
 
   async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
@@ -102,6 +123,7 @@ export default function UploadPage() {
       return;
     }
     setWorkerStatus("processing");
+    setProgressInfo({ status: "processing", progress: 1 });
 
     // Build mapped rows based on mapping
     const mappedRows = rawRowsRef.current.map((orig: any, idx: number) => {
@@ -124,16 +146,23 @@ export default function UploadPage() {
         mapping,
         options: {}, // fetch from local settings if you have them
       };
+
       // clusterData returns the worker's messages combined in a final structure
       const res = await window.electronAPI.clusterData(payload);
+
+      // If main forwards progress messages instead of returning final object,
+      // clusterData might simply return when done. We handle both shapes.
       if (res && res.success) {
         setClusters(res.clusters || []);
         setWorkerStatus("done");
-        alert(`Clustering complete: ${((res.clusters || []).length)} clusters found`);
+        setProgressInfo({ status: "done", progress: 100 });
         // Save to cache on main
         const cacheId = "cache-" + Date.now() + "-" + Math.random().toString(36).slice(2,9);
         await window.electronAPI.cacheSave(cacheId, { rows: res.rows, clusters: res.clusters });
         sessionStorage.setItem("cacheId", cacheId);
+        sessionStorage.setItem("cacheTimestamp", Date.now().toString());
+        // Notify user
+        alert(`Clustering complete: ${((res.clusters || []).length)} clusters found — saved as ${cacheId}`);
       } else if (res && res.type === "progress") {
         setWorkerStatus(res.status || "processing");
       } else {
@@ -147,18 +176,37 @@ export default function UploadPage() {
     }
   }
 
-  async function handleExport() {
-    if (!clusters || clusters.length === 0) {
-      alert("No clusters to export");
+  async function handleExportReport() {
+    // Use the generateExport flow that saves Excel using main process
+    const cacheId = sessionStorage.getItem("cacheId");
+    if (!cacheId) {
+      alert("No cache found. Run clustering first.");
       return;
     }
-    const report = {
-      rows: clusters.flatMap((cluster: any[], idx: number) => cluster.records.map((r: any) => ({ clusterId: idx + 1, ...r }))),
-    };
-    const res = await window.electronAPI.exportReport(report);
-    if (res && res.success) alert("Saved to: " + res.path);
-    else alert("Export cancelled or failed");
+    setWorkerStatus("exporting");
+    try {
+      const res = await window.electronAPI.generateExport(cacheId);
+      if (res && res.ok) {
+        alert("Export saved to: " + res.path);
+      } else {
+        alert("Export failed: " + (res?.error || "unknown"));
+      }
+    } catch (err: any) {
+      alert("Export error: " + String(err));
+    } finally {
+      setWorkerStatus("done");
+    }
   }
+
+  const formattedStatus = () => {
+    const s = progressInfo.status || "idle";
+    let statusText = s.replace(/-/g, " ");
+    statusText = statusText.charAt(0).toUpperCase() + statusText.slice(1);
+    if (progressInfo.completed !== undefined && progressInfo.total) {
+      return `Status: ${statusText} (${progressInfo.completed}/${progressInfo.total})`;
+    }
+    return `Status: ${statusText}`;
+  };
 
   return (
     <div className="p-6">
@@ -195,12 +243,24 @@ export default function UploadPage() {
         <button className="btn mr-2" onClick={startClustering} disabled={workerStatus === "processing"}>
           {workerStatus === "processing" ? "Processing…" : "Start Clustering"}
         </button>
-        <button className="btn" onClick={handleExport} disabled={clusters.length === 0}>
+        <button className="btn" onClick={handleExportReport} disabled={workerStatus === "processing" || !sessionStorage.getItem("cacheId")}>
           Export Report
         </button>
       </div>
 
-      {workerStatus === "done" && (
+      {(workerStatus !== "idle" && workerStatus !== "done") && (
+        <div className="space-y-2 mt-4">
+          <div className="flex justify-between items-center text-sm font-medium text-muted-foreground">
+            <span>{formattedStatus()}</span>
+            <span>{Math.round(progressInfo.progress)}%</span>
+          </div>
+          <div className="relative h-4 w-full overflow-hidden rounded-full bg-secondary">
+            <div className="absolute h-full bg-blue-600" style={{ width: `${progressInfo.progress}%` }} />
+          </div>
+        </div>
+      )}
+
+      {workerStatus === "done" && clusters.length > 0 && (
         <div>
           <h3 className="text-lg font-medium">Results</h3>
           <div className="mt-2">
@@ -221,4 +281,4 @@ export default function UploadPage() {
       )}
     </div>
   );
-  }
+    }
